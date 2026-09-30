@@ -1,0 +1,196 @@
+name: Build-360T7
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH 连接'
+        type: boolean
+        required: false
+        default: false
+  # schedule:
+  #   - cron: '0 2 * * 0'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      actions: write
+      contents: write
+    env:
+      TZ: Asia/Shanghai
+      REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
+      REPO_BRANCH: openwrt-24.10-6.6
+
+    steps:
+    - name: 检出仓库
+      uses: actions/checkout@v4
+
+    - name: 准备编译空间
+      run: sudo mkdir -p /workdir && sudo chown "$USER:$GROUPS" /workdir
+
+    - name: 最大化磁盘空间
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 10240
+        swap-size-mb: 2048
+        build-mount-path: /workdir
+        overprovision-lvm: 'true'
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
+        remove-docker-images: 'true'
+
+    - name: 安装编译依赖
+      run: |
+        echo "::group::安装编译依赖"
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install --no-install-recommends ack antlr3 asciidoc autoconf \
+          automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio \
+          curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib g++-multilib \
+          git gnutls-dev gperf haveged help2man intltool libc6-dev-i386 libelf-dev \
+          libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev \
+          libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm \
+          lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 \
+          python3-pip python3-ply python3-docutils python3-pyelftools qemu-utils re2c rsync \
+          scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget \
+          xmlto xxd zlib1g-dev zstd libfuse-dev
+        sudo timedatectl set-timezone Asia/Shanghai
+        echo "::endgroup::"
+
+    - name: 克隆源码
+      working-directory: /workdir
+      run: |
+        echo "::group::克隆源码 ($REPO_BRANCH)"
+        git clone --depth=1 "$REPO_URL" -b "$REPO_BRANCH" openwrt
+        ln -sf /workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
+        echo "::endgroup::"
+
+    - name: 恢复 Ccache
+      uses: actions/cache@v5
+      with:
+        path: ~/.ccache
+        key: ${{ runner.os }}-ccache-360t7-${{ hashFiles('360T7/360t7.config') }}
+        restore-keys: ${{ runner.os }}-ccache-360t7-
+
+    - name: 加载 Feeds
+      run: |
+        echo "::group::feeds update & install"
+        cd openwrt && ./scripts/feeds update -a && ./scripts/feeds install -a
+        echo "::endgroup::"
+
+    - name: 应用 DIY 配置
+      run: |
+        echo "::group::复制配置文件"
+        cp 360T7/360t7.config openwrt/.config
+        chmod +x 360T7/diy-360t7.sh
+        echo "::endgroup::"
+        echo "::group::执行 diy-360t7.sh"
+        cd openwrt && "$GITHUB_WORKSPACE/360T7/diy-360t7.sh"
+        echo "::endgroup::"
+
+    - name: SSH 连接（可选）
+      if: ${{ github.event_name == 'workflow_dispatch' && inputs.ssh == true }}
+      uses: owenthereal/action-upterm@v1.15.0
+      with:
+        limit-access-to-actor: false
+
+    - name: 下载源码包
+      working-directory: /workdir/openwrt
+      run: |
+        echo "::group::make defconfig"
+        make defconfig
+        echo "::endgroup::"
+        echo "::group::make download"
+        make download -j8
+        find dl -size -1024c -exec rm -f {} \;
+        echo "::endgroup::"
+
+    - name: 编译固件
+      id: compile
+      working-directory: /workdir/openwrt
+      run: |
+        export PATH="/usr/lib/ccache:$PATH"
+        mkdir -p ~/.ccache
+        ccache -M 4G && ccache -z
+        echo "::group::多线程编译 -j$(nproc)"
+        if make -j$(nproc); then
+          echo "status=success" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+        else
+          echo "::endgroup::"
+          echo "::warning::多线程失败，切换单线程排错..."
+          echo "::group::单线程编译 V=s"
+          if make -j1 V=s; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          fi
+          echo "::endgroup::"
+        fi
+
+    - name: 检查空间使用
+      if: ${{ !cancelled() }}
+      run: df -hT
+
+    - name: 打包固件
+      if: ${{ steps.compile.outputs.status == 'success' }}
+      run: |
+        echo "::group::整理固件"
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> "$GITHUB_ENV"
+        echo "::endgroup::"
+
+    - name: 生成 Release 描述
+      id: release
+      if: ${{ steps.compile.outputs.status == 'success' }}
+      run: |
+        TAG_NAME="360T7_$(date +%Y%m%d)"
+        DATE="$(date '+%Y-%m-%d %H:%M')"
+        upstream_version=$(cat "$FIRMWARE/version.buildinfo" 2>/dev/null || echo "unknown")
+        upstream_commit=$(git -C openwrt rev-parse HEAD)
+        {
+          echo "- **源码**: [$REPO_URL]($REPO_URL)"
+          echo "- **分支**: $REPO_BRANCH"
+          echo "- **上游版本**: $upstream_version"
+          echo "- **上游提交**: [\`${upstream_commit:0:12}\`]($REPO_URL/commit/$upstream_commit)"
+          echo "- **编译时间**: $DATE (Asia/Shanghai)"
+          echo ""
+          echo "### 更新日志"
+          [ -f "360T7/logs.txt" ] && cat "360T7/logs.txt" || echo "- 常规更新"
+        } > /tmp/desc.txt
+        echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+
+    - name: 上传 Release
+      if: ${{ steps.compile.outputs.status == 'success' }}
+      uses: ncipollo/release-action@v1
+      with:
+        name: "OpenWrt-360T7"
+        tag: ${{ steps.release.outputs.tag }}
+        artifacts: "openwrt/bin/targets/*/*/*"
+        allowUpdates: true
+        token: ${{ secrets.GITHUB_TOKEN }}
+        bodyFile: /tmp/desc.txt
+
+    - name: 上传固件目录
+      if: ${{ steps.compile.outputs.status == 'success' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: OpenWrt_360T7-${{ github.run_number }}
+        path: openwrt/bin
+
+    - name: 清理旧记录
+      uses: Mattraks/delete-workflow-runs@v2
+      with:
+        retain_days: 5
+        keep_minimum_runs: 10
+
+    - name: 清理旧 Release
+      uses: dev-drprasad/delete-older-releases@master
+      with:
+        keep_latest: 10
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
